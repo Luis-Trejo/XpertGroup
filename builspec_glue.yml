@@ -1,0 +1,19 @@
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.9
+    commands:
+      - echo "[INFO] Instalando dependencias de Glue Job"
+      - pip install -r requirements.txt -t .
+
+  build:
+    commands:
+      - echo "[INFO] Copiando script de limpieza al bucket de S3"
+      - cd glue_jobs
+      - aws s3 cp clean_data.py s3://your-artifact-bucket/glue-scripts/data_cleaning.py
+
+artifacts:
+  files:
+    - data_cleaning.py
