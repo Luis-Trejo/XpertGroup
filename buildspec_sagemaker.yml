@@ -1,0 +1,26 @@
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.9
+    commands:
+      - echo "[INFO] Instalando dependencias para entrenamiento de modelo"
+      - pip install -r requirements.txt
+
+  build:
+    commands:
+      - echo "[INFO] Ejecutando entrenamiento"
+      - python model/train_model.py
+      - echo "[INFO] Creando artefacto tar.gz para SageMaker"
+      - mkdir -p model_artifacts/code
+      - cp model/training.py model_artifacts/code/
+      - cp model_training/model.joblib model_artifacts/
+      - cp model_training/inference.py model_artifacts/code/
+      - tar -czf model.tar.gz -C model_artifacts .
+      - echo "[INFO] Subiendo modelo a S3"
+      - aws s3 cp model.tar.gz s3://your-artifact-bucket/sagemaker-models/model.tar.gz
+
+artifacts:
+  files:
+    - model.tar.gz
