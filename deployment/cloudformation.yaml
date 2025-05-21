@@ -1,0 +1,253 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CI/CD Pipeline for Glue Job and SageMaker Model Deployment
+
+Parameters:
+  RepositoryName:
+    Type: String
+    Default: clothes-pipeline-repo
+  S3Bucket:
+    Type: String
+    Description: S3 bucket where source and artifacts will be stored
+  GlueJobName:
+    Type: String
+    Default: clothes-cleaning-job
+  SageMakerModelName:
+    Type: String
+    Default: clothes-model
+
+Resources:
+
+  CodeCommitRepository:
+    Type: AWS::CodeCommit::Repository
+    Properties:
+      RepositoryName: !Ref RepositoryName
+      Code:
+        BranchName: main
+        S3:
+          Bucket: !Ref S3Bucket
+          Key: source/initial.zip
+
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: GlueSageMakerBuildAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:StartJobRun
+                  - glue:GetJobRun
+                  - glue:GetJob
+                  - glue:BatchGetJobs
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                  - cloudformation:DescribeStacks
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - sagemaker:CreateModel
+                  - sagemaker:CreateEndpointConfig
+                  - sagemaker:CreateEndpoint
+                  - sagemaker:Describe*
+                  - sagemaker:InvokeEndpoint
+                Resource: '*'
+
+  GlueBuildProject:
+  Type: AWS::CodeBuild::Project
+  Properties:
+    Name: clothes-glue-build
+    Source:
+      Type: CODECOMMIT
+      Location: !GetAtt CodeCommitRepository.CloneUrlHttp
+      BuildSpec: buildspec_glue.yml
+    Environment:
+      ComputeType: BUILD_GENERAL1_SMALL
+      Image: aws/codebuild/python:3.9-1.0
+      Type: LINUX_CONTAINER
+      EnvironmentVariables:
+        - Name: BUCKET
+          Value: !Ref S3Bucket
+    ServiceRole: !GetAtt CodeBuildRole.Arn
+    Artifacts:
+      Type: NO_ARTIFACTS
+
+  SageMakerBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: clothes-sagemaker-build
+      Source:
+        Type: CODECOMMIT
+        Location: !GetAtt CodeCommitRepository.CloneUrlHttp
+        BuildSpec: buildspec_sagemaker.yml
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/python:3.9-1.0
+        Type: LINUX_CONTAINER
+        EnvironmentVariables:
+          - Name: BUCKET
+            Value: !Ref S3Bucket
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts:
+      Type: NO_ARTIFACTS
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaDeployAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:StartJobRun
+                  - sagemaker:CreateModel
+                  - sagemaker:CreateEndpointConfig
+                  - sagemaker:CreateEndpoint
+                  - s3:GetObject
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  GlueSageMakerDeployLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: clothes-deploy-function
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+
+          def lambda_handler(event, context):
+              glue = boto3.client('glue')
+              sm = boto3.client('sagemaker')
+              job_name = event.get('GlueJobName', 'clothes-cleaning-job')
+              model_name = event.get('ModelName', 'clothes-model')
+
+              glue.start_job_run(JobName=job_name)
+
+              sm.create_model(
+                  ModelName=model_name,
+                  PrimaryContainer={
+                      'Image': '683313688378.dkr.ecr.us-east-1.amazonaws.com/xgboost:1',
+                      'ModelDataUrl': f's3://{event["S3Bucket"]}/model/model.tar.gz',
+                      'Environment': {'SAGEMAKER_PROGRAM': 'inference.py'}
+                  },
+                  ExecutionRoleArn=context.invoked_function_arn
+              )
+
+              sm.create_endpoint_config(
+                  EndpointConfigName=f'{model_name}-config',
+                  ProductionVariants=[{
+                      'VariantName': 'AllTraffic',
+                      'ModelName': model_name,
+                      'InitialInstanceCount': 1,
+                      'InstanceType': 'ml.m5.large'
+                  }]
+              )
+
+              sm.create_endpoint(
+                  EndpointName=f'{model_name}-endpoint',
+                  EndpointConfigName=f'{model_name}-config'
+              )
+
+              return {'statusCode': 200, 'body': 'Glue Job and SageMaker model deployed successfully'}
+
+  CodePipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodePipelinePermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                  - codecommit:Get* 
+                  - codecommit:GitPull
+                  - lambda:InvokeFunction
+                Resource: '*'
+
+  CodePipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      RoleArn: !GetAtt CodePipelineRole.Arn
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: SourceAction
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeCommit
+                Version: '1'
+              OutputArtifacts:
+                - Name: SourceOutput
+              Configuration:
+                RepositoryName: !Ref RepositoryName
+                BranchName: main
+        - Name: Build
+          Actions:
+            - Name: BuildAction
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: BuildOutput
+              Configuration:
+                ProjectName: !Ref CodeBuildProject
+        - Name: Deploy
+          Actions:
+            - Name: LambdaDeploy
+              ActionTypeId:
+                Category: Invoke
+                Owner: AWS
+                Provider: Lambda
+                Version: '1'
+              InputArtifacts:
+                - Name: BuildOutput
+              Configuration:
+                FunctionName: !Ref GlueSageMakerDeployLambda
+
+Outputs:
+  PipelineName:
+    Value: !Ref CodePipeline
+    Description: The name of the created CodePipeline
+
+  LambdaFunction:
+    Value: !Ref GlueSageMakerDeployLambda
+    Description: Lambda function that triggers Glue Job and SageMaker Model deployment
